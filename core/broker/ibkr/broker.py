@@ -43,5 +43,14 @@ class IBKRBroker(Broker):
     def add_order_listener(self, listener) -> None:
         self.connection.add_order_listener(listener)
 
+    def subscribe(self, instrument, req_id: int) -> None:
+        self.connection.subscribe(instrument, req_id)
+
+    def unsubscribe(self, req_id: int) -> None:
+        self.connection.unsubscribe(req_id)
+
+    def set_market_data_type(self, mode: int) -> None:
+        self.connection.set_market_data_type(mode)
+
     async def sync_state(self, local: LocalSnapshot) -> ReconciliationResult:
         return await self.connection.sync_state(local)

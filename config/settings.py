@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     ibkr_connect_timeout_seconds: int = 15
     ibkr_stale_data_seconds: int = 10
 
+    market_data_symbols: str = ""
+    market_data_type: int = Field(default=1, ge=1, le=4)
+
+    @property
+    def watched_symbols(self) -> list[str]:
+        return [s.strip().upper() for s in self.market_data_symbols.split(",") if s.strip()]
+
     max_daily_loss_pct: float = Field(default=1.0, gt=0)
     max_total_exposure_pct: float = Field(default=20.0, gt=0, le=100)
     max_open_positions: int = Field(default=3, ge=1)

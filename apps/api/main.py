@@ -1,20 +1,28 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
-from apps.api.deps import get_sessionmaker
+from apps.api.deps import close_quote_store, get_quote_store, get_sessionmaker
 from config.settings import settings
+from core.market.models import utcnow
+from core.market.redis_store import RedisQuoteStore
+from core.market.resolver import ContractResolutionError, ContractResolver
 from database.broker_state import latest_state_event
 from database.session import engine
+
+resolver = ContractResolver()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # The API never owns a broker connection; it only reads what the worker recorded.
     yield
+    await close_quote_store()
     await engine.dispose()
 
 
@@ -73,3 +81,69 @@ async def system_status(
         }
     )
     return payload
+
+
+def _freshness(payload: dict[str, Any]) -> dict[str, Any]:
+    """Age a quote against the same limit risk uses, so readers see what traders get."""
+    limit = float(settings.ibkr_stale_data_seconds)
+    raw = payload.get("received_at")
+
+    if not raw:
+        return {"age_seconds": None, "stale": True, "max_age_seconds": limit}
+
+    try:
+        stamp = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return {"age_seconds": None, "stale": True, "max_age_seconds": limit}
+
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+
+    age = (utcnow() - stamp).total_seconds()
+    return {"age_seconds": round(age, 3), "stale": age > limit, "max_age_seconds": limit}
+
+
+@app.get("/api/market/{symbol}")
+async def market_quote(
+    symbol: str, store: RedisQuoteStore = Depends(get_quote_store)
+) -> dict[str, Any]:
+    try:
+        instrument = resolver.resolve(symbol)
+    except ContractResolutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        quote = await store.load(instrument.key)
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="market data cache unavailable") from exc
+
+    if quote is None:
+        raise HTTPException(status_code=404, detail=f"no market data for {instrument.symbol}")
+
+    return {**quote, **_freshness(quote)}
+
+
+@app.websocket("/ws/market")
+async def market_stream(
+    websocket: WebSocket,
+    symbol: str | None = Query(default=None),
+    store: RedisQuoteStore = Depends(get_quote_store),
+) -> None:
+    """Publish ticks to browsers; reads Redis, never the broker."""
+    await websocket.accept()
+
+    instrument_key: str | None = None
+    if symbol is not None:
+        try:
+            instrument_key = resolver.resolve(symbol).key
+        except ContractResolutionError:
+            await websocket.close(code=1008, reason="unsupported symbol")
+            return
+
+    try:
+        async for tick in store.stream(instrument_key):
+            await websocket.send_json({**tick, **_freshness(tick)})
+    except WebSocketDisconnect:
+        return
+    except RedisError:
+        await websocket.close(code=1011, reason="market data cache unavailable")

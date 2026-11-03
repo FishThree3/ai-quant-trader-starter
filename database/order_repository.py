@@ -112,7 +112,9 @@ class SqlAlchemyOrderRepository:
     ) -> bool:
         async with self.session_factory() as session:
             duplicate = (
-                await session.execute(select(Execution.id).where(Execution.broker_exec_id == exec_id))
+                await session.execute(
+                    select(Execution.id).where(Execution.broker_exec_id == exec_id)
+                )
             ).one_or_none()
             if duplicate is not None:
                 return False

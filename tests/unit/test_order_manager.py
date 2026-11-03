@@ -89,6 +89,7 @@ def intent(**overrides) -> LimitOrderIntent:
 async def build_manager(session_factory, gateway):
     journal: list[str] = []
     repository = JournalRepository(session_factory, journal)
+    gateway.journal = journal
     manager = OrderManager(
         gateway,
         repository,
@@ -179,11 +180,39 @@ async def test_internal_uuid_is_assigned_and_unique(session_factory):
     await manager.submit(second)
 
     assert first.order_uuid != second.order_uuid
-    assert str(first.order_uuid) != str(first.order_uuid.int)  # a real UUID object
+    assert first.order_uuid.int > 0
+
+
+async def test_order_lookup_returns_its_own_instrument(session_factory):
+    """Guards against a missing join: two instruments must not cross-contaminate."""
+    from database.models import Instrument
+    from uuid import uuid4
+
+    async with session_factory() as session:
+        session.add(
+            Instrument(
+                id=uuid4(),
+                symbol="MSFT",
+                sec_type="STK",
+                exchange="SMART",
+                currency="USD",
+            )
+        )
+        await session.commit()
+
+    manager, _, order = await submit_one(session_factory, FakeGateway())
+    record = await manager.repository.get_order(order.order_uuid)
+
+    assert record.symbol == "AAPL"
 
 
 async def test_transmission_failure_leaves_order_unknown(session_factory):
-    manager, _, order = await submit_one(session_factory, FakeGateway(fail_place=True))
+    gateway = FakeGateway(fail_place=True)
+    manager, _ = await build_manager(session_factory, gateway)
+    order = intent()
+
+    with pytest.raises(OSError):
+        await manager.submit(order)
 
     row = await fetch_order(session_factory, order.order_uuid)
 
@@ -226,12 +255,25 @@ async def test_update_for_unknown_order_is_not_adopted(session_factory):
         assert (await session.execute(select(Order.id))).all() == []
 
 
-async def test_stale_update_after_fill_becomes_unknown(session_factory):
+async def test_stale_update_after_fill_is_ignored_not_overwritten(session_factory):
+    """A settled order is a fact; late chatter must not rewrite it."""
     manager, _, order = await submit_one(session_factory, FakeGateway())
     await manager.apply_order_update(broker_order_id=100, perm_id=1, status_raw="Filled", filled=10.0, remaining=0.0)
 
-    resolved = await manager.apply_order_update(
+    returned = await manager.apply_order_update(
         broker_order_id=100, perm_id=1, status_raw="Submitted", filled=0.0, remaining=10.0
+    )
+
+    assert returned.status == OrderStatus.FILLED
+    assert "order.update_ignored" in await audit_actions(session_factory)
+
+
+async def test_contradiction_on_a_live_order_becomes_unknown(session_factory):
+    manager, _, order = await submit_one(session_factory, FakeGateway())
+    await manager.apply_order_update(broker_order_id=100, perm_id=1, status_raw="Submitted", filled=0.0, remaining=10.0)
+
+    resolved = await manager.apply_order_update(
+        broker_order_id=100, perm_id=1, status_raw="Created", filled=0.0, remaining=10.0
     )
 
     assert resolved.status == OrderStatus.UNKNOWN
@@ -287,10 +329,17 @@ async def test_cancellation_is_idempotent(session_factory):
     await manager.apply_order_update(broker_order_id=100, perm_id=1, status_raw="Submitted", filled=0.0, remaining=10.0)
 
     first = await manager.cancel(order.order_uuid)
-    second = await manager.cancel(order.order_uuid)
+    while_pending = await manager.cancel(order.order_uuid)
 
     assert first == "cancel_requested"
-    assert second == "already_cancelled"
+    assert while_pending == "cancel_pending"
+    assert gateway.cancelled == [100]
+
+    # Only once the broker confirms does a repeat become "already_cancelled".
+    await manager.apply_order_update(broker_order_id=100, perm_id=1, status_raw="Cancelled", filled=0.0, remaining=10.0)
+    after = await manager.cancel(order.order_uuid)
+
+    assert after == "already_cancelled"
     assert gateway.cancelled == [100]
 
 
@@ -320,6 +369,39 @@ async def test_cancelling_an_unsent_order_is_local_only(session_factory):
 
 
 # --- error codes --------------------------------------------------------------
+
+
+async def test_code_354_no_market_data_rejects_the_order(session_factory):
+    """The live case: TWS silently declines orders for contracts without data."""
+    manager, _, order = await submit_one(session_factory, FakeGateway())
+
+    await manager.apply_error(100, 354, "No market data for this contract, order not accepted")
+
+    row = await fetch_order(session_factory, order.order_uuid)
+    assert row.status == OrderStatus.REJECTED
+
+
+async def test_late_error_on_a_settled_order_changes_nothing(session_factory):
+    """IBKR sends 161 after a cancel already confirmed; it must not reopen the record."""
+    manager, _, order = await submit_one(session_factory, FakeGateway())
+    await manager.cancel(order.order_uuid)
+    await manager.apply_order_update(broker_order_id=100, perm_id=1, status_raw="Cancelled", filled=0.0, remaining=10.0)
+
+    await manager.apply_error(100, 161, "Cancel Request failed since order was not cancellable")
+
+    row = await fetch_order(session_factory, order.order_uuid)
+    assert row.status == OrderStatus.CANCELLED
+    assert "order.error_ignored" in await audit_actions(session_factory)
+
+
+async def test_unrecognised_order_code_is_audited_without_guessing(session_factory):
+    manager, _, order = await submit_one(session_factory, FakeGateway())
+
+    await manager.apply_error(100, 10197, "Request Market Data farming warning")
+
+    row = await fetch_order(session_factory, order.order_uuid)
+    assert row.status == OrderStatus.PENDING_SUBMIT
+    assert "order.error_observed" in await audit_actions(session_factory)
 
 
 async def test_order_failed_becomes_rejected(session_factory):

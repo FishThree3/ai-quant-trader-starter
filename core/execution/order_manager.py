@@ -18,6 +18,12 @@ log = structlog.get_logger()
 ORDER_FAILED = 201
 ORDER_CANCELLED = 202
 CANCEL_REQUEST_FAILED = 203
+INITIALISATION_FAILED = 300
+INVALID_CONTRACT = 354
+
+# Codes that mean TWS did not accept the order. 354 in particular arrives when the
+# account has no market data for the contract, and TWS then silently declines it.
+REJECT_CODES = frozenset({ORDER_FAILED, INITIALISATION_FAILED, INVALID_CONTRACT})
 
 _LOCAL_ONLY_CANCELLABLE = {OrderStatus.CREATED, OrderStatus.PENDING_SUBMIT}
 
@@ -166,8 +172,18 @@ class OrderManager:
         try:
             ensure_transition(order.status, target)
         except InvalidTransition as exc:
-            # An update we cannot explain is never applied as-is.
-            log.error("order_update_rejected", order=str(order.order_uuid), error=str(exc))
+            # Terminal records are settled facts and are never rewritten; for a live
+            # order a contradiction is unresolvable locally, so it becomes UNKNOWN,
+            # which reconciliation refuses to trade through.
+            if is_terminal(OrderStatus(order.status)):
+                await self._audit(
+                    "order.update_ignored",
+                    str(order.order_uuid),
+                    {"status": order.status},
+                    {"attempted": str(target), "error": str(exc)},
+                )
+                return order
+
             await self.repository.update_order(order.order_uuid, status=OrderStatus.UNKNOWN)
             await self._audit(
                 "order.update_rejected",
@@ -175,6 +191,7 @@ class OrderManager:
                 {"status": order.status},
                 {"attempted": str(target), "error": str(exc)},
             )
+            log.error("order_update_rejected", order=str(order.order_uuid), error=str(exc))
             return await self.repository.get_order(order.order_uuid)
 
         await self.repository.update_order(order.order_uuid, **fields)
@@ -186,7 +203,9 @@ class OrderManager:
             {"status": str(target), "filled": filled},
         )
         await self._publish(
-            EventType.ORDER_SUBMITTED if target is OrderStatus.SUBMITTED else EventType.ORDER_UPDATED,
+            EventType.ORDER_SUBMITTED
+            if target is OrderStatus.SUBMITTED
+            else EventType.ORDER_UPDATED,
             {"order_uuid": str(order.order_uuid), "status": str(target)},
         )
         return updated
@@ -228,7 +247,11 @@ class OrderManager:
         return True
 
     async def apply_error(self, broker_order_id: int | None, code: int, message: str) -> None:
-        """Apply the three order-related IBKR codes that carry state meaning."""
+        """Apply the IBKR order codes that carry a definite state meaning.
+
+        A code with no known meaning is audited but never guessed at; reconciliation
+        is the backstop that catches any divergence the codes cannot describe.
+        """
         if broker_order_id is None or broker_order_id < 0:
             return
 
@@ -236,21 +259,42 @@ class OrderManager:
         if order is None:
             return
 
-        if code == ORDER_FAILED:
-            await self._transition(
-                order, OrderStatus.REJECTED, reason=f"IBKR {code}: {message}"
+        if is_terminal(OrderStatus(order.status)):
+            # Late chatter must not overwrite a fact the broker already settled.
+            await self._audit(
+                "order.error_ignored",
+                str(order.order_uuid),
+                {"status": order.status},
+                {"code": code, "message": message},
             )
+            return
+
+        if code in REJECT_CODES:
+            await self._transition(order, OrderStatus.REJECTED, reason=f"IBKR {code}: {message}")
         elif code == ORDER_CANCELLED:
             await self._transition(order, OrderStatus.CANCELLED, reason=f"IBKR {code}: {message}")
         elif code == CANCEL_REQUEST_FAILED:
             # The order is still working but its true state is now uncertain.
             await self._transition(order, OrderStatus.UNKNOWN, reason=f"IBKR {code}: {message}")
+        else:
+            await self._audit(
+                "order.error_observed",
+                str(order.order_uuid),
+                {"status": order.status},
+                {"code": code, "message": message},
+            )
 
     async def _transition(self, order: OrderRecord, target: OrderStatus, *, reason: str) -> None:
         try:
             ensure_transition(order.status, target)
         except InvalidTransition as exc:
             log.error("transition_refused", order=str(order.order_uuid), error=str(exc))
+            await self._audit(
+                "order.transition_refused",
+                str(order.order_uuid),
+                {"status": order.status},
+                {"attempted": str(target), "reason": reason, "error": str(exc)},
+            )
             return
 
         fields: dict[str, object] = {"status": target}
@@ -272,7 +316,9 @@ class OrderManager:
             return
 
         notional = sum(float(r["quantity"]) * float(r["price"]) for r in rows)
-        await self.repository.update_order(order.order_uuid, filled_quantity=quantity, avg_fill_price=notional / quantity)
+        await self.repository.update_order(
+            order.order_uuid, filled_quantity=quantity, avg_fill_price=notional / quantity
+        )
 
     async def _locate(self, broker_order_id: int | None, perm_id: int | None) -> OrderRecord | None:
         if broker_order_id is not None:

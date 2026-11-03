@@ -118,6 +118,12 @@ class IBKRApp(EWrapper, EClient):  # type: ignore[misc]
     def execDetailsEnd(self, reqId):  # noqa: N802
         self.owner._on_exec_details_end(reqId)
 
+    def tickPrice(self, reqId, tickType, price, attribs):  # noqa: N802
+        self.owner._on_tick(reqId, tickType, price)
+
+    def tickSize(self, reqId, tickType, size, attribs):  # noqa: N802
+        self.owner._on_tick(reqId, tickType, size)
+
     def connectionClosed(self):  # noqa: N802
         self.owner._on_connection_closed()
 
@@ -312,7 +318,9 @@ class IBKRConnectionManager:
         self._order_listeners.append(listener)
 
     def is_ready(self) -> bool:
-        return self.state is BrokerState.READY
+        # Allocation must be possible too: READY without an order id would let the
+        # order manager persist a CREATED row it then cannot transmit.
+        return self.state is BrokerState.READY and self.next_order_id is not None
 
     def place_limit_order(self, intent: Any) -> int:
         """Transmit a LIMIT order; never trusts this call as proof of acceptance."""
@@ -326,11 +334,9 @@ class IBKRConnectionManager:
 
         order_id = self.allocate_order_id()
 
-        contract = Contract()
-        contract.symbol = intent.symbol
-        contract.secType = intent.sec_type
-        contract.exchange = intent.exchange
-        contract.currency = intent.currency
+        contract = _wire_contract(
+            intent.symbol, intent.sec_type, intent.exchange, intent.currency
+        )
 
         order = IBKRWireOrder()
         order.action = intent.side
@@ -342,6 +348,27 @@ class IBKRConnectionManager:
         self._app.placeOrder(order_id, contract, order)
         return order_id
 
+    def subscribe(self, instrument: Any, req_id: int) -> None:
+        """Open one streaming market-data line for an instrument."""
+        if Contract is None or self._app is None:
+            raise RuntimeError(
+                "Official IBKR TWS API Python package (ibapi) is not installed. "
+                "Install it from the official TWS API download."
+            )
+        contract = _wire_contract(
+            instrument.symbol, instrument.sec_type, instrument.exchange, instrument.currency
+        )
+        self._app.reqMktData(req_id, contract, "", False, False, [])
+
+    def unsubscribe(self, req_id: int) -> None:
+        if self._app is None:
+            return
+        self._app.cancelMktData(req_id)
+
+    def set_market_data_type(self, mode: int) -> None:
+        if self._app is not None:
+            self._app.reqMarketDataType(mode)
+
     def cancel_order(self, broker_order_id: int) -> None:
         if OrderCancel is None or self._app is None:
             raise RuntimeError(
@@ -350,7 +377,7 @@ class IBKRConnectionManager:
             )
         self._app.cancelOrder(broker_order_id, OrderCancel())
 
-    def _dispatch(self, method_name: str, *args: Any) -> None:
+    def _dispatch(self, method_name: str, *args: Any, **kwargs: Any) -> None:
         """Deliver a reader-thread event to listeners without blocking the reader."""
         if not self._order_listeners or self._loop is None:
             return
@@ -360,7 +387,9 @@ class IBKRConnectionManager:
             if handler is None:
                 continue
             try:
-                future = asyncio.run_coroutine_threadsafe(handler(*args), self._loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    handler(*args, **kwargs), self._loop
+                )
             except RuntimeError as exc:  # loop already closed during shutdown
                 print(f"listener dispatch failed: {exc}")
                 continue
@@ -391,7 +420,9 @@ class IBKRConnectionManager:
             remaining=converted.quantity - converted.filled,
         )
 
-    def _on_order_status(self, *, orderId, status, filled, remaining, perm_id, avg_fill_price) -> None:
+    def _on_order_status(
+        self, *, orderId, status, filled, remaining, perm_id, avg_fill_price
+    ) -> None:
         self._dispatch(
             "apply_order_update",
             broker_order_id=_optional_int(orderId),
@@ -427,6 +458,9 @@ class IBKRConnectionManager:
             return
         self._executions_end.set()
 
+    def _on_tick(self, req_id: int, tick_type: int, value: Any) -> None:
+        self._dispatch("apply_tick", int(req_id), int(tick_type), value)
+
     def _on_connection_closed(self) -> None:
         self.state = BrokerState.DISCONNECTED
         self._identified_event.clear()
@@ -451,6 +485,16 @@ class IBKRConnectionManager:
             self.state = BrokerState.SYNCING
 
         self._dispatch("apply_error", req_id, code, message)
+
+
+def _wire_contract(symbol: str, sec_type: str, exchange: str, currency: str):
+    """Build the ibapi Contract used by both market data and orders."""
+    contract = Contract()
+    contract.symbol = symbol
+    contract.secType = sec_type
+    contract.exchange = exchange
+    contract.currency = currency
+    return contract
 
 
 def _log_dispatch_failure(future) -> None:

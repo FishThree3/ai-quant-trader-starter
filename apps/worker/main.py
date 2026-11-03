@@ -9,8 +9,14 @@ from config.settings import settings
 from core.broker.base import BrokerStatus
 from core.broker.ibkr.broker import IBKRBroker
 from core.broker.ibkr.connection import IBKRConnectionConfig
+from core.events.bus import EventBus
+from core.execution.order_manager import OrderManager
+from core.market.redis_store import RedisQuoteStore
+from core.market.resolver import ContractResolutionError, ContractResolver
+from core.market.service import MarketDataService
 from core.reconciliation.models import ReconciliationResult
 from database.broker_state import record_state_event
+from database.order_repository import SqlAlchemyOrderRepository
 from database.reconciliation_store import load_local_snapshot, persist_broker_snapshot
 from database.session import SessionLocal
 
@@ -84,6 +90,30 @@ async def reconcile_broker_state(broker: IBKRBroker) -> None:
     await publish_state(broker, "reconciliation.completed", result)
 
 
+async def start_market_data(service: MarketDataService) -> None:
+    """Open lines for the configured watchlist; unconfigured means no subscriptions."""
+    symbols = settings.watched_symbols
+    if not symbols:
+        log.info("market_data_idle", reason="MARKET_DATA_SYMBOLS is empty")
+        return
+
+    resolver = ContractResolver()
+    for symbol in symbols:
+        try:
+            instrument = resolver.resolve(symbol)
+        except ContractResolutionError as exc:
+            log.error("market_data_symbol_rejected", symbol=symbol, error=str(exc))
+            continue
+
+        subscribed = await service.subscribe(instrument, "worker")
+        log.info(
+            "market_data_watch",
+            symbol=instrument.symbol,
+            subscribed=subscribed,
+            ticker_limit_reached=service.ticker_limit_reached,
+        )
+
+
 async def run() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -102,6 +132,28 @@ async def run() -> None:
         )
     )
 
+    # Registered before reconciliation so replayed open orders reach the same
+    # state machine as live callbacks.
+    bus = EventBus()
+    quote_store = RedisQuoteStore.from_url(
+        settings.redis_url, ttl_seconds=max(60, settings.ibkr_stale_data_seconds * 3)
+    )
+    order_manager = OrderManager(
+        broker,
+        SqlAlchemyOrderRepository(SessionLocal),
+        trading_mode=settings.trading_mode,
+        allow_live_trading=settings.allow_live_trading,
+        event_bus=bus,
+    )
+    market_service = MarketDataService(
+        broker,
+        stale_seconds=float(settings.ibkr_stale_data_seconds),
+        store=quote_store,
+        event_bus=bus,
+    )
+    broker.add_order_listener(order_manager)
+    broker.add_order_listener(market_service)
+
     try:
         await broker.connect()
         await publish_state(broker, "broker.identified")
@@ -115,10 +167,14 @@ async def run() -> None:
             allow_live_trading=settings.allow_live_trading,
             last_error=status.last_error,
         )
+        if broker.is_ready():
+            broker.set_market_data_type(settings.market_data_type)
+            await start_market_data(market_service)
         await stop.wait()
     finally:
         await broker.disconnect()
         await publish_state(broker, "broker.disconnected")
+        await quote_store.aclose()
 
 
 if __name__ == "__main__":
