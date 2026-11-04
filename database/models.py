@@ -4,7 +4,17 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Uuid, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Uuid,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -138,3 +148,18 @@ class AuditLog(Base, TimestampMixin):
     object_id: Mapped[str | None] = mapped_column(String(128))
     before_json: Mapped[dict | None] = mapped_column(JSON)
     after_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class SystemControl(Base):
+    """Single-row durable record of the trading gate.
+
+    ``id`` is a fixed constant so the row is an upsert target rather than a history table:
+    the history belongs in audit_logs, and readers must never have to guess which row wins.
+    """
+
+    __tablename__ = "system_controls"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    actor: Mapped[str] = mapped_column(String(128), nullable=False, default="system")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

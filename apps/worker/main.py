@@ -9,6 +9,8 @@ from config.settings import settings
 from core.broker.base import BrokerStatus
 from core.broker.ibkr.broker import IBKRBroker
 from core.broker.ibkr.connection import IBKRConnectionConfig
+from core.controls.kill_switch import KillSwitch
+from core.controls.redis_plane import RedisControlPlane
 from core.events.bus import EventBus
 from core.execution.order_manager import OrderManager
 from core.market.redis_store import RedisQuoteStore
@@ -19,6 +21,7 @@ from database.broker_state import record_state_event
 from database.order_repository import SqlAlchemyOrderRepository
 from database.reconciliation_store import load_local_snapshot, persist_broker_snapshot
 from database.session import SessionLocal
+from database.system_control import SystemControlStore
 
 log = structlog.get_logger()
 
@@ -114,6 +117,34 @@ async def start_market_data(service: MarketDataService) -> None:
         )
 
 
+async def guard_trading_gate(gate: KillSwitch, stop: asyncio.Event) -> None:
+    """Re-read the gate on a timer, because an unread gate is an unsafe gate."""
+    interval = max(2.0, settings.ibkr_stale_data_seconds / 3)
+    while not stop.is_set():
+        state = await gate.refresh()
+        log.info(
+            "trading_gate_checked",
+            state=state.state.value,
+            new_orders_allowed=gate.allows_new_orders(),
+            reason=state.reason,
+            actor=state.actor,
+        )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+async def watch_control_signals(plane: RedisControlPlane, gate: KillSwitch) -> None:
+    """Accelerate on a recorded change; the timer above is what guarantees safety."""
+    try:
+        async for signal in plane.stream():
+            state = await gate.refresh()
+            log.info("trading_gate_refreshed_by_signal", signal=signal, state=state.state.value)
+    except Exception as exc:
+        log.warning("control_signal_stream_failed", error=str(exc))
+
+
 async def run() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -138,9 +169,16 @@ async def run() -> None:
     quote_store = RedisQuoteStore.from_url(
         settings.redis_url, ttl_seconds=max(60, settings.ibkr_stale_data_seconds * 3)
     )
+    control_plane = RedisControlPlane.from_url(settings.redis_url)
+    gate = KillSwitch(
+        SystemControlStore(SessionLocal),
+        control_plane=control_plane,
+        max_age_seconds=float(settings.ibkr_stale_data_seconds) * 3,
+    )
     order_manager = OrderManager(
         broker,
         SqlAlchemyOrderRepository(SessionLocal),
+        gate=gate,
         trading_mode=settings.trading_mode,
         allow_live_trading=settings.allow_live_trading,
         event_bus=bus,
@@ -154,10 +192,15 @@ async def run() -> None:
     broker.add_order_listener(order_manager)
     broker.add_order_listener(market_service)
 
+    guard: asyncio.Task | None = None
+    signaler: asyncio.Task | None = None
     try:
         await broker.connect()
         await publish_state(broker, "broker.identified")
         await reconcile_broker_state(broker)
+        gate_state = await gate.refresh()
+        guard = asyncio.create_task(guard_trading_gate(gate, stop))
+        signaler = asyncio.create_task(watch_control_signals(control_plane, gate))
         status = await broker.status()
         log.info(
             "worker_started",
@@ -165,6 +208,9 @@ async def run() -> None:
             next_order_id=status.next_order_id,
             trading_mode=settings.trading_mode.value,
             allow_live_trading=settings.allow_live_trading,
+            trading_state=gate_state.state.value,
+            new_orders_allowed=order_manager.gate.allows_new_orders(),
+            gate_reason=gate_state.reason,
             last_error=status.last_error,
         )
         if broker.is_ready():
@@ -172,9 +218,13 @@ async def run() -> None:
             await start_market_data(market_service)
         await stop.wait()
     finally:
+        for task in (guard, signaler):
+            if task is not None:
+                task.cancel()
         await broker.disconnect()
         await publish_state(broker, "broker.disconnected")
         await quote_store.aclose()
+        await control_plane.aclose()
 
 
 if __name__ == "__main__":

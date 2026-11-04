@@ -4,6 +4,7 @@ import structlog
 from uuid import UUID
 
 from config.settings import TradingMode
+from core.controls.kill_switch import TradingGate
 from core.events.models import DomainEvent, EventType, utcnow
 from core.execution.gateway import OrderGateway
 from core.execution.orders import LimitOrderIntent, map_broker_status
@@ -54,6 +55,7 @@ class OrderManager:
         gateway: OrderGateway,
         repository: OrderRepository,
         *,
+        gate: TradingGate,
         trading_mode: TradingMode,
         allow_live_trading: bool,
         event_bus=None,
@@ -64,10 +66,17 @@ class OrderManager:
         self.gateway = gateway
         self.repository = repository
         self.trading_mode = trading_mode
+        # Required, not defaulted: a manager with no kill switch would submit orders
+        # that nothing in the system can stop.
+        self.gate = gate
         self.event_bus = event_bus
 
     async def submit(self, intent: LimitOrderIntent) -> UUID:
         """Persist CREATED, then transmit. A broker failure leaves the order UNKNOWN."""
+        # The human gate is consulted first: a kill must outrank every other readiness
+        # signal, including a perfectly healthy broker.
+        self.gate.require_new_orders_allowed()
+
         # Checked again per submission, not just at construction: a live flag flipped
         # at runtime must not be able to reach the socket.
         if self.trading_mode is TradingMode.LIVE:
@@ -108,7 +117,11 @@ class OrderManager:
         return intent.order_uuid
 
     async def cancel(self, order_uuid: UUID) -> str:
-        """Idempotent cancellation: repeating it never re-transmits."""
+        """Idempotent cancellation, deliberately never gated by the kill switch.
+
+        Reducing exposure has to stay possible while new business is blocked, so this path
+        checks nothing but the order's own state.
+        """
         order = await self.repository.get_order(order_uuid)
         if order is None:
             raise OrderNotFoundError(str(order_uuid))

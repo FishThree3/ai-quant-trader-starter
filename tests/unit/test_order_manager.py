@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from config.settings import TradingMode
+from core.controls.kill_switch import AlwaysActive
 from core.execution.order_manager import (
     BrokerNotReady,
     LiveTradingRefused,
@@ -86,13 +87,15 @@ def intent(**overrides) -> LimitOrderIntent:
     return LimitOrderIntent(**base)
 
 
-async def build_manager(session_factory, gateway):
+async def build_manager(session_factory, gateway, gate=None):
+    gate = gate or AlwaysActive()
     journal: list[str] = []
     repository = JournalRepository(session_factory, journal)
     gateway.journal = journal
     manager = OrderManager(
         gateway,
         repository,
+        gate=gate,
         trading_mode=TradingMode.PAPER,
         allow_live_trading=False,
     )
@@ -125,6 +128,7 @@ def test_live_mode_is_refused_at_construction():
         OrderManager(
             FakeGateway(),
             None,
+            gate=AlwaysActive(),
             trading_mode=TradingMode.LIVE,
             allow_live_trading=False,
         )

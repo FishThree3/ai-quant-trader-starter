@@ -36,9 +36,12 @@ async def test_paper_limit_order_lifecycle():
     from core.execution.orders import LimitOrderIntent
     from core.reconciliation.engine import reconcile
     from database.models import OrderStatus
+    from core.controls.kill_switch import KillSwitch
+    from core.controls.redis_plane import RedisControlPlane
     from database.order_repository import SqlAlchemyOrderRepository
-    from database.reconciliation_store import load_local_snapshot, persist_broker_snapshot
     from database.session import SessionLocal
+    from database.system_control import SystemControlStore
+    from database.reconciliation_store import load_local_snapshot, persist_broker_snapshot
 
     broker = IBKRBroker(
         IBKRConnectionConfig(
@@ -48,9 +51,19 @@ async def test_paper_limit_order_lifecycle():
             timeout_seconds=settings.ibkr_connect_timeout_seconds,
         )
     )
+    gate = KillSwitch(
+        SystemControlStore(SessionLocal),
+        control_plane=RedisControlPlane.from_url(settings.redis_url),
+    )
+    await gate.refresh()
+    if not gate.allows_new_orders():
+        reason = gate.state.reason if gate.state else "gate never read"
+        pytest.fail(f"trading gate is not ACTIVE ({reason}); POST /api/system/resume first")
+
     manager = OrderManager(
         broker,
         SqlAlchemyOrderRepository(SessionLocal),
+        gate=gate,
         trading_mode=settings.trading_mode,
         allow_live_trading=settings.allow_live_trading,
     )

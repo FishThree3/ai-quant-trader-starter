@@ -6,8 +6,9 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from apps.api.deps import get_sessionmaker
+from apps.api.deps import get_kill_switch, get_sessionmaker
 from apps.api.main import app
+from core.controls.kill_switch import AlwaysActive
 from database.broker_state import latest_state_event, record_state_event
 from database.models import Base
 
@@ -34,8 +35,10 @@ async def session_factory():
 
 
 @asynccontextmanager
-async def client_for(factory):
+async def client_for(factory, gate=None):
     app.dependency_overrides[get_sessionmaker] = lambda: factory
+    # Without this the endpoint would dial a real Redis that does not exist in tests.
+    app.dependency_overrides[get_kill_switch] = lambda: gate or AlwaysActive()
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
