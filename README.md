@@ -97,4 +97,4 @@ python -m ruff check . --select E4,E7,E9,F
 
 尚未完成：账户 NAV/购买力实时快照与挂单风险预占、完整成交→持仓投影、持仓感知的减仓/退出风控、确定性策略/历史回放/费用滑点回测、断线自动恢复 supervisor，以及 AI 研究层。禁止通过注入“始终通过”的生产风控来绕过这些缺口。账户前缀保护是额外防误配置措施，不能取代 TWS 模拟登录及只读权限。
 
-本次审计、验证结果与剩余边界见 [重构报告](docs/REFACTOR_REPORT.md)。`docs/CODEX_PROMPTS.md` 是历史规划，不是已实现能力清单。
+本次审计、验证结果与剩余边界见 [重构报告](docs/REFACTOR_REPORT.md)。完整算法的后续建设见 [详细实施规划总索引](docs/implementation/README.md)：12 份专题覆盖数据、策略、AI、回测、风控、执行、数据库、运维、工作包与验收；这些是待实施设计，不是已实现功能。`docs/CODEX_PROMPTS.md` 是历史规划，不是已实现能力清单。
