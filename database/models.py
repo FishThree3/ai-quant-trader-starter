@@ -88,6 +88,9 @@ class Order(Base, TimestampMixin):
     signal_id: Mapped[UUID | None] = mapped_column(ForeignKey("signals.id"))
     side: Mapped[str] = mapped_column(String(16), nullable=False)
     order_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    time_in_force: Mapped[str] = mapped_column(
+        String(16), default="DAY", server_default="DAY", nullable=False
+    )
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     limit_price: Mapped[float | None] = mapped_column(Float)
     stop_price: Mapped[float | None] = mapped_column(Float)

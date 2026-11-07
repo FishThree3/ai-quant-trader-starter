@@ -31,6 +31,9 @@ def _event_metadata(status: BrokerStatus, result: ReconciliationResult | None) -
         "next_order_id": status.next_order_id,
         "account_present": status.account is not None,
         "trading_mode": settings.trading_mode.value,
+        "read_only": settings.ibkr_read_only,
+        # No strategy/account risk context is wired into this worker yet.
+        "submission_enabled": False,
         "reconciliation": result.summary() if result is not None else None,
     }
 
@@ -117,6 +120,18 @@ async def start_market_data(service: MarketDataService) -> None:
         )
 
 
+async def publish_heartbeat(broker: IBKRBroker, stop: asyncio.Event) -> None:
+    """Persist liveness and changes even when no orders or quotes arrive."""
+    while not stop.is_set():
+        await publish_state(broker, "broker.heartbeat", broker.connection.last_reconciliation)
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=max(1, settings.ibkr_stale_data_seconds / 3)
+            )
+        except TimeoutError:
+            pass
+
+
 async def guard_trading_gate(gate: KillSwitch, stop: asyncio.Event) -> None:
     """Re-read the gate on a timer, because an unread gate is an unsafe gate."""
     interval = max(2.0, settings.ibkr_stale_data_seconds / 3)
@@ -154,14 +169,7 @@ async def run() -> None:
         except NotImplementedError:  # Windows fallback
             pass
 
-    broker = IBKRBroker(
-        IBKRConnectionConfig(
-            host=settings.ibkr_host,
-            port=settings.ibkr_port,
-            client_id=settings.ibkr_client_id,
-            timeout_seconds=settings.ibkr_connect_timeout_seconds,
-        )
-    )
+    broker = IBKRBroker(IBKRConnectionConfig.from_settings(settings))
 
     # Registered before reconciliation so replayed open orders reach the same
     # state machine as live callbacks.
@@ -194,6 +202,7 @@ async def run() -> None:
 
     guard: asyncio.Task | None = None
     signaler: asyncio.Task | None = None
+    heartbeat: asyncio.Task | None = None
     try:
         await broker.connect()
         await publish_state(broker, "broker.identified")
@@ -201,6 +210,7 @@ async def run() -> None:
         gate_state = await gate.refresh()
         guard = asyncio.create_task(guard_trading_gate(gate, stop))
         signaler = asyncio.create_task(watch_control_signals(control_plane, gate))
+        heartbeat = asyncio.create_task(publish_heartbeat(broker, stop))
         status = await broker.status()
         log.info(
             "worker_started",
@@ -218,13 +228,16 @@ async def run() -> None:
             await start_market_data(market_service)
         await stop.wait()
     finally:
-        for task in (guard, signaler):
-            if task is not None:
-                task.cancel()
-        await broker.disconnect()
-        await publish_state(broker, "broker.disconnected")
-        await quote_store.aclose()
-        await control_plane.aclose()
+        tasks = [task for task in (guard, signaler, heartbeat) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await broker.disconnect()
+            await publish_state(broker, "broker.disconnected")
+        finally:
+            await quote_store.aclose()
+            await control_plane.aclose()
 
 
 if __name__ == "__main__":

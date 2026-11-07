@@ -15,11 +15,18 @@ TERMINAL_STATUSES = frozenset(
 # "transition" to itself; that keeps handling idempotent.
 ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.CREATED: frozenset(
-        {OrderStatus.CREATED, OrderStatus.PENDING_SUBMIT, OrderStatus.REJECTED, OrderStatus.UNKNOWN}
+        {
+            OrderStatus.CREATED,
+            OrderStatus.PENDING_SUBMIT,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.UNKNOWN,
+        }
     ),
     OrderStatus.PENDING_SUBMIT: frozenset(
         {
             OrderStatus.PENDING_SUBMIT,
+            OrderStatus.CANCEL_PENDING,
             OrderStatus.SUBMITTED,
             OrderStatus.PARTIALLY_FILLED,
             OrderStatus.FILLED,

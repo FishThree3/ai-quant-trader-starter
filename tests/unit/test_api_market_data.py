@@ -91,6 +91,132 @@ def test_stale_quote_is_flagged_not_hidden(client_factory):
     assert body["max_age_seconds"] == 10.0
 
 
+def test_recent_transport_activity_does_not_hide_stale_bbo(client_factory):
+    stamp = datetime.now(timezone.utc)
+    q = Quote(AAPL, stamp - timedelta(seconds=30), bid=100.0, ask=101.0)
+    q = q.with_tick("volume", 100.0, stamp)
+    store = FakeStore({AAPL.key: q.as_dict()})
+    with client_factory(store) as client:
+        body = client.get("/api/market/AAPL").json()
+    assert body["stale"] is True
+    assert body["age_seconds"] >= 30
+    assert body["received_at"] == stamp.isoformat()
+    assert body["price_at"] == q.price_at.isoformat()
+
+
+@pytest.mark.parametrize("mode", [2, 3, 4])
+def test_frozen_and_delayed_modes_are_stale_for_rest_and_stream(client_factory, mode):
+    q = Quote(AAPL, datetime.now(timezone.utc), bid=100.0, ask=101.0, market_data_type=mode)
+    store = FakeStore({AAPL.key: q.as_dict()})
+    with client_factory(store) as client:
+        assert client.get("/api/market/AAPL").json()["stale"] is True
+        with client.websocket_connect("/ws/market?symbol=AAPL") as ws:
+            assert ws.receive_json()["stale"] is True
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"bid": None},
+        {"ask": None},
+        {"bid": 102.0},  # crossed
+        {"bid": 0.0},
+        {"bid": -1.0},
+        {"bid": float("nan")},
+        {"ask": float("inf")},
+        {"ask": -float("inf")},
+        {"delayed": True},
+        {"market_data_type": 2},
+        {"market_data_type": 3},
+        {"market_data_type": 4},
+        {"market_data_type": None},
+        {"market_data_type": True},
+        {"bid_at": None},
+        {"ask_at": None},
+        {"bid_at": "not a timestamp"},
+        {"ask_at": "2026-11-03T15:00:00"},  # naive is ambiguous
+        {"received_at": None},
+        {"received_at": "garbled"},
+        {"received_at": "2026-11-03T15:00:00"},
+    ],
+)
+def test_freshness_rejects_nonexecutable_payloads(monkeypatch, updates):
+    from importlib import import_module
+
+    module = import_module("apps.api.main")
+    now = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "utcnow", lambda: now)
+    payload = Quote(AAPL, now, bid=100.0, ask=101.0).as_dict()
+    payload.update(updates)
+    assert module._freshness(payload)["stale"] is True
+
+
+@pytest.mark.parametrize("field", ["bid_at", "ask_at", "received_at"])
+def test_freshness_rejects_future_timestamps_even_when_other_side_is_current(monkeypatch, field):
+    from importlib import import_module
+
+    module = import_module("apps.api.main")
+    now = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "utcnow", lambda: now)
+    payload = Quote(AAPL, now, bid=100.0, ask=101.0).as_dict()
+    payload[field] = (now + timedelta(seconds=1)).isoformat()
+    assert module._freshness(payload)["stale"] is True
+
+
+def test_freshness_ignores_claimed_derived_price_at_and_requires_per_side_stamps(monkeypatch):
+    from importlib import import_module
+
+    module = import_module("apps.api.main")
+    now = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "utcnow", lambda: now)
+    payload = Quote(AAPL, now - timedelta(seconds=11), bid=100.0, ask=101.0).as_dict()
+    payload["received_at"] = payload["price_at"] = now.isoformat()
+    assert module._freshness(payload)["stale"] is True
+    assert module._freshness(payload)["age_seconds"] == 11
+    del payload["bid_at"]
+    del payload["ask_at"]
+    assert module._freshness(payload)["stale"] is True  # old worker cache fails closed
+    assert module._freshness(payload)["age_seconds"] is None
+
+
+@pytest.mark.parametrize("seconds", [0, 10, 10.000001, 11])
+def test_api_and_quote_gate_agree_at_exact_age_boundary(monkeypatch, seconds):
+    from importlib import import_module
+
+    module = import_module("apps.api.main")
+    now = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "utcnow", lambda: now)
+    q = Quote(AAPL, now - timedelta(seconds=seconds), bid=100.0, ask=101.0)
+    payload = q.with_tick("volume", 10.0, now).as_dict()
+    freshness = module._freshness(payload)
+    assert freshness["stale"] is (not q.is_fresh(freshness["max_age_seconds"], now))
+
+
+async def test_published_subscription_tombstone_is_stale_to_api(monkeypatch):
+    from importlib import import_module
+
+    from core.market.service import MarketDataService
+
+    class Gateway:
+        def subscribe(self, instrument, req_id):
+            pass
+
+        def unsubscribe(self, req_id):
+            pass
+
+    module = import_module("apps.api.main")
+    now = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "utcnow", lambda: now)
+    store = FakeStore()
+    svc = MarketDataService(Gateway(), store=store, clock=lambda: now)
+    await svc.subscribe(AAPL, "a")
+    await svc.apply_tick(90_000, 1, 100.0)
+    await svc.apply_tick(90_000, 2, 101.0)
+    assert module._freshness(await store.load(AAPL.key))["stale"] is False
+    await svc.unsubscribe(AAPL, "a")
+    assert module._freshness(await store.load(AAPL.key))["stale"] is True
+
+
 def test_missing_quote_is_a_404(client_factory):
     with client_factory(FakeStore()) as client:
         response = client.get("/api/market/AAPL")

@@ -43,7 +43,7 @@ async def settle():
 
 
 def contract():
-    return SimpleNamespace(code="AAPL", secType="STK", currency="USD")
+    return SimpleNamespace(symbol="AAPL", secType="STK", currency="USD")
 
 
 def order(perm_id=1001, action="BOT", total=10.0, lmt=250.0):
@@ -162,9 +162,7 @@ async def test_dispatch_without_listener_is_harmless():
 
 async def test_dispatch_before_loop_capture_is_skipped():
     """Callbacks that arrive before connect() has a loop must not crash the reader."""
-    manager = IBKRConnectionManager(
-        IBKRConnectionConfig(host="127.0.0.1", port=7497, client_id=99)
-    )
+    manager = IBKRConnectionManager(IBKRConnectionConfig(host="127.0.0.1", port=7497, client_id=99))
     listener = RecordingListener()
     manager.add_order_listener(listener)
 

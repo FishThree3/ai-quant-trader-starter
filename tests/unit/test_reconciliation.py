@@ -47,7 +47,9 @@ def broker_order(perm=1001, order_id=17, side="BOT", quantity=10.0, filled=0.0, 
     )
 
 
-def local_order(ref="local-1", perm=1001, order_id=17, side="BUY", quantity=10.0, filled=0.0, status="SUBMITTED"):
+def local_order(
+    ref="local-1", perm=1001, order_id=17, side="BUY", quantity=10.0, filled=0.0, status="SUBMITTED"
+):
     return LocalOrder(
         ref=ref,
         perm_id=perm,
@@ -109,9 +111,7 @@ def test_side_aliases_bot_and_buy_are_equivalent():
 def test_partial_fill_mismatch_is_detected():
     broker = broker_snapshot(
         orders=(broker_order(quantity=10.0, filled=4.0),),
-        executions=(
-            BrokerExecution("EX-1", 1001, AAPL, "BOT", 4.0, 250.0),
-        ),
+        executions=(BrokerExecution("EX-1", 1001, AAPL, "BOT", 4.0, 250.0),),
     )
     local = local_snapshot(
         orders=(local_order(quantity=10.0, filled=2.0, status="PARTIALLY_FILLED"),),
@@ -225,7 +225,7 @@ def test_average_cost_difference_is_advisory_only():
     assert [f.code for f in result.advisory] == [FindingCode.POSITION_COST_MISMATCH]
 
 
-def test_multiple_position_rows_for_one_instrument_are_netted():
+def test_positions_from_different_accounts_must_not_be_netted_clean():
     broker = broker_snapshot(
         positions=(
             BrokerPosition(AAPL, 6.0, 250.0, account="DUR123456"),
@@ -234,7 +234,8 @@ def test_multiple_position_rows_for_one_instrument_are_netted():
     )
     local = local_snapshot(positions=(LocalPosition("pos-1", AAPL, 10.0, 250.0),))
 
-    assert reconcile(broker, local).ok
+    assert not reconcile(broker, local).ok
+    assert FindingCode.ACCOUNT_MISMATCH in {f.code for f in reconcile(broker, local).blocking}
 
 
 def test_missing_barrier_is_blocking_not_clean():
@@ -280,3 +281,45 @@ def test_summary_reports_counts_for_invariant_reporting():
     assert summary["ok"] is True
     assert summary["orders_matched"] == 1
     assert summary["blocking"] == []
+
+
+def test_sent_pending_order_absent_at_broker_blocks():
+    result = reconcile(
+        broker_snapshot(),
+        local_snapshot(orders=(local_order(perm=None, order_id=17, status="PENDING_SUBMIT"),)),
+    )
+    assert FindingCode.LOCAL_ONLY_OPEN_ORDER in {f.code for f in result.blocking}
+
+
+def test_matched_unknown_order_still_blocks_until_durably_resolved():
+    result = reconcile(
+        broker_snapshot(orders=(broker_order(),)),
+        local_snapshot(orders=(local_order(status="UNKNOWN"),)),
+    )
+    assert FindingCode.LOCAL_ORDER_UNRESOLVED in {f.code for f in result.blocking}
+
+
+def test_identity_conflicts_block_even_when_numeric_order_id_matches():
+    from dataclasses import replace
+
+    for broker_row in (
+        broker_order(perm=9999),
+        replace(broker_order(), instrument=InstrumentKey.of("MSFT", "STK", "USD")),
+    ):
+        result = reconcile(
+            broker_snapshot(orders=(broker_row,)), local_snapshot(orders=(local_order(),))
+        )
+        assert FindingCode.ORDER_IDENTITY_MISMATCH in {f.code for f in result.blocking}
+
+
+def test_same_exec_id_with_different_owner_or_economics_blocks():
+    for row in (
+        LocalExecution("e", "EX-1", 9999, 4, 250),
+        LocalExecution("e", "EX-1", 1001, 5, 250),
+        LocalExecution("e", "EX-1", 1001, 4, 999),
+    ):
+        result = reconcile(
+            broker_snapshot(executions=(BrokerExecution("EX-1", 1001, AAPL, "BOT", 4, 250),)),
+            local_snapshot(orders=(local_order(status="FILLED", filled=10),), executions=(row,)),
+        )
+        assert FindingCode.EXECUTION_MISMATCH in {f.code for f in result.blocking}

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+from functools import wraps
+from math import isfinite
+
 import structlog
 from uuid import UUID
 
 from config.settings import TradingMode
 from core.controls.kill_switch import TradingGate
 from core.events.models import DomainEvent, EventType, utcnow
-from core.execution.gateway import OrderGateway
+from core.execution.gateway import OrderGateway, PreTradeCheck
 from core.execution.orders import LimitOrderIntent, map_broker_status
 from core.execution.repository import OrderRecord, OrderRepository
 from core.execution.state_machine import InvalidTransition, ensure_transition, is_terminal
@@ -19,12 +23,9 @@ log = structlog.get_logger()
 ORDER_FAILED = 201
 ORDER_CANCELLED = 202
 CANCEL_REQUEST_FAILED = 203
-INITIALISATION_FAILED = 300
-INVALID_CONTRACT = 354
-
-# Codes that mean TWS did not accept the order. 354 in particular arrives when the
-# account has no market data for the contract, and TWS then silently declines it.
-REJECT_CODES = frozenset({ORDER_FAILED, INITIALISATION_FAILED, INVALID_CONTRACT})
+# Market-data request IDs and order IDs share the callback argument, not a
+# namespace. Codes 300/354 describe ticker requests, not rejection of an order.
+REJECT_CODES = frozenset({ORDER_FAILED})
 
 _LOCAL_ONLY_CANCELLABLE = {OrderStatus.CREATED, OrderStatus.PENDING_SUBMIT}
 
@@ -39,6 +40,36 @@ class BrokerNotReady(RuntimeError):
 
 class OrderNotFoundError(LookupError):
     pass
+
+
+class RiskCheckRequired(RuntimeError):
+    pass
+
+
+class OrderIntentConflict(ValueError):
+    pass
+
+
+def _serialized(method):
+    """One writer per manager; broker callbacks must not race command persistence."""
+
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        async with self._lock:
+            self._pending_events = []
+            try:
+                result = await method(self, *args, **kwargs)
+                events = self._pending_events
+            finally:
+                self._pending_events = []
+        # Subscribers may submit/cancel orders. Never run external handlers while
+        # holding the lifecycle lock, or they will deadlock reacquiring it.
+        if self.event_bus is not None:
+            for event in events:
+                await self.event_bus.publish(event)
+        return result
+
+    return wrapped
 
 
 class OrderManager:
@@ -58,6 +89,7 @@ class OrderManager:
         gate: TradingGate,
         trading_mode: TradingMode,
         allow_live_trading: bool,
+        risk_check: PreTradeCheck | None = None,
         event_bus=None,
     ) -> None:
         if trading_mode is TradingMode.LIVE and not allow_live_trading:
@@ -70,52 +102,85 @@ class OrderManager:
         # that nothing in the system can stop.
         self.gate = gate
         self.event_bus = event_bus
+        self.risk_check = risk_check
+        self._lock = asyncio.Lock()
+        self._pending_events: list[DomainEvent] = []
 
-    async def submit(self, intent: LimitOrderIntent) -> UUID:
-        """Persist CREATED, then transmit. A broker failure leaves the order UNKNOWN."""
-        # The human gate is consulted first: a kill must outrank every other readiness
-        # signal, including a perfectly healthy broker.
+    def _require_ready(self) -> None:
         self.gate.require_new_orders_allowed()
-
-        # Checked again per submission, not just at construction: a live flag flipped
-        # at runtime must not be able to reach the socket.
         if self.trading_mode is TradingMode.LIVE:
             raise LiveTradingRefused("Order submission is not permitted in LIVE mode")
-        if not self.gateway.is_ready():
-            raise BrokerNotReady("Broker is not READY; refusing to allocate an order id")
+        can_submit = getattr(self.gateway, "can_submit_orders", self.gateway.is_ready)
+        if not can_submit():
+            raise BrokerNotReady("Broker is not READY for writable orders; refusing new orders")
 
+    @_serialized
+    async def submit(self, intent: LimitOrderIntent) -> UUID:
+        """Durably bind identity before send; UUID replays never retransmit."""
+        existing = await self.repository.get_order(intent.order_uuid)
+        if existing is not None:
+            for field in (
+                "symbol",
+                "sec_type",
+                "exchange",
+                "currency",
+                "side",
+                "quantity",
+                "limit_price",
+                "time_in_force",
+            ):
+                if getattr(existing, field) != getattr(intent, field):
+                    raise OrderIntentConflict(f"order_uuid reused with different {field}")
+            return existing.order_uuid
+
+        self._require_ready()
+        if self.risk_check is None:
+            raise RiskCheckRequired("An explicit pre-trade risk check is required")
+        await self.risk_check.authorize(intent)
+        self._require_ready()
         instrument_id = await self.repository.ensure_instrument(intent)
         await self.repository.insert_created_order(intent, instrument_id)
         await self._audit("order.created", str(intent.order_uuid), None, self._intent_view(intent))
-        await self._publish(EventType.ORDER_CREATED, {"order_uuid": str(intent.order_uuid)})
 
-        try:
-            broker_order_id = self.gateway.place_limit_order(intent)
-        except Exception as exc:
-            # The request may or may not have left the process, so claim ignorance
-            # rather than marking it rejected or submitted.
-            await self.repository.update_order(intent.order_uuid, status=OrderStatus.UNKNOWN)
-            await self._audit(
-                "order.transmission_unknown", str(intent.order_uuid), None, {"error": str(exc)}
-            )
-            log.error("order_transmission_unknown", order=str(intent.order_uuid), error=str(exc))
-            raise
-
+        # A reserved broker ID is durable before any request can leave the process.
+        # PENDING_SUBMIT means uncertain until a callback/reconciliation confirms it.
+        broker_order_id = self.gateway.allocate_order_id()
         await self.repository.update_order(
             intent.order_uuid,
             broker_order_id=broker_order_id,
             status=OrderStatus.PENDING_SUBMIT,
             submitted_at=utcnow(),
         )
+        try:
+            await self.risk_check.authorize(intent)
+            self._require_ready()  # No await between the final gates and the socket.
+        except BaseException:
+            await self.repository.update_order(
+                intent.order_uuid, status=OrderStatus.CANCELLED, completed_at=utcnow()
+            )
+            raise
+        try:
+            returned_id = self.gateway.place_limit_order(intent, broker_order_id)
+            if returned_id != broker_order_id:
+                raise RuntimeError("Gateway changed the reserved broker order ID")
+        except BaseException as exc:
+            await self.repository.update_order(intent.order_uuid, status=OrderStatus.UNKNOWN)
+            await self._audit(
+                "order.transmission_unknown", str(intent.order_uuid), None, {"error": str(exc)}
+            )
+            raise
+
         await self._audit(
             "order.submitted",
             str(intent.order_uuid),
             {"status": OrderStatus.CREATED},
             {"status": OrderStatus.PENDING_SUBMIT, "broker_order_id": broker_order_id},
         )
+        await self._publish(EventType.ORDER_CREATED, {"order_uuid": str(intent.order_uuid)})
         log.info("order_submitted", order=str(intent.order_uuid), broker_order_id=broker_order_id)
         return intent.order_uuid
 
+    @_serialized
     async def cancel(self, order_uuid: UUID) -> str:
         """Idempotent cancellation, deliberately never gated by the kill switch.
 
@@ -142,9 +207,14 @@ class OrderManager:
             return "not_transmitted"
 
         await self._transition(order, OrderStatus.CANCEL_PENDING, reason="cancel requested")
-        self.gateway.cancel_order(order.broker_order_id)
+        try:
+            self.gateway.cancel_order(order.broker_order_id)
+        except BaseException:
+            await self.repository.update_order(order_uuid, status=OrderStatus.UNKNOWN)
+            raise
         return "cancel_requested"
 
+    @_serialized
     async def apply_order_update(
         self,
         *,
@@ -170,7 +240,34 @@ class OrderManager:
             )
             return None
 
+        if (
+            not isfinite(filled)
+            or filled < 0
+            or filled > order.quantity
+            or (remaining is not None and (not isfinite(remaining) or remaining < 0))
+        ):
+            raise ValueError("Invalid broker fill quantities")
+        # Redelivered older cumulative status must never reduce known exposure.
+        if filled < order.filled_quantity:
+            if status_raw in {"Cancelled", "ApiCancelled", "PendingCancel", "Expired"}:
+                filled = order.filled_quantity
+            else:
+                await self._audit(
+                    "order.update_ignored",
+                    str(order.order_uuid),
+                    {"filled": order.filled_quantity},
+                    {"stale_filled": filled},
+                )
+                return order
         target = map_broker_status(status_raw, filled=filled, remaining=remaining)
+        if target is OrderStatus.FILLED and filled != order.quantity:
+            target = OrderStatus.UNKNOWN
+        # A still-working acknowledgement cannot erase an in-flight cancel request.
+        if order.status == OrderStatus.CANCEL_PENDING and target in {
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+        }:
+            target = OrderStatus.CANCEL_PENDING
         fields: dict[str, object] = {
             "filled_quantity": filled,
             "status": target,
@@ -223,9 +320,18 @@ class OrderManager:
         )
         return updated
 
+    @_serialized
     async def apply_execution(self, execution: BrokerExecution) -> bool:
         """Record a fill exactly once per IBKR execId."""
-        order = await self._locate(None, execution.perm_id)
+        if (
+            not execution.exec_id
+            or not isfinite(execution.quantity)
+            or execution.quantity <= 0
+            or not isfinite(execution.price)
+            or execution.price <= 0
+        ):
+            raise ValueError("Invalid broker execution")
+        order = await self._locate(execution.broker_order_id, execution.perm_id)
         if order is None:
             log.warning(
                 "execution_for_unknown_order",
@@ -233,6 +339,17 @@ class OrderManager:
                 perm_id=execution.perm_id,
             )
             return False
+
+        expected_side = {"BOT": "BUY", "SLD": "SELL"}.get(execution.side, execution.side)
+        if (
+            execution.instrument.symbol != order.symbol
+            or execution.instrument.sec_type != order.sec_type
+            or execution.instrument.currency != order.currency
+            or expected_side != order.side
+        ):
+            raise ValueError("Execution does not match the order instrument/side")
+        if order.broker_perm_id is None and execution.perm_id is not None:
+            await self.repository.update_order(order.order_uuid, broker_perm_id=execution.perm_id)
 
         inserted = await self.repository.insert_execution(
             order_uuid=order.order_uuid,
@@ -242,11 +359,12 @@ class OrderManager:
             exchange=execution.exchange,
             executed_at=execution.executed_at or utcnow(),
         )
+        # A replay also repairs a crash between execution commit and projection update.
+        await self._recalculate_average_fill(order)
         if not inserted:
             log.info("execution_duplicate_ignored", exec_id=execution.exec_id)
             return False
 
-        await self._recalculate_average_fill(order)
         await self._audit(
             "execution.recorded",
             str(order.order_uuid),
@@ -259,6 +377,7 @@ class OrderManager:
         )
         return True
 
+    @_serialized
     async def apply_error(self, broker_order_id: int | None, code: int, message: str) -> None:
         """Apply the IBKR order codes that carry a definite state meaning.
 
@@ -308,7 +427,7 @@ class OrderManager:
                 {"status": order.status},
                 {"attempted": str(target), "reason": reason, "error": str(exc)},
             )
-            return
+            raise
 
         fields: dict[str, object] = {"status": target}
         if is_terminal(target):
@@ -329,18 +448,33 @@ class OrderManager:
             return
 
         notional = sum(float(r["quantity"]) * float(r["price"]) for r in rows)
-        await self.repository.update_order(
-            order.order_uuid, filled_quantity=quantity, avg_fill_price=notional / quantity
-        )
+        filled = max(quantity, order.filled_quantity)
+        fields: dict[str, object] = {"filled_quantity": filled}
+        # Partial execDetails cannot provide a trustworthy average for a larger
+        # cumulative orderStatus total. Wait until the execution ledger catches up.
+        if quantity >= order.filled_quantity:
+            fields["avg_fill_price"] = notional / quantity
+        if filled > order.quantity:
+            fields["status"] = OrderStatus.UNKNOWN
+        elif filled == order.quantity:
+            fields.update(status=OrderStatus.FILLED, completed_at=order.completed_at or utcnow())
+        elif not is_terminal(order.status) and order.status != OrderStatus.CANCEL_PENDING:
+            fields["status"] = OrderStatus.PARTIALLY_FILLED
+        await self.repository.update_order(order.order_uuid, **fields)
 
     async def _locate(self, broker_order_id: int | None, perm_id: int | None) -> OrderRecord | None:
-        if broker_order_id is not None:
-            found = await self.repository.find_by_broker_order_id(broker_order_id)
-            if found is not None:
-                return found
-        if perm_id is not None:
-            return await self.repository.find_by_perm_id(perm_id)
-        return None
+        by_perm = await self.repository.find_by_perm_id(perm_id) if perm_id else None
+        by_order = (
+            await self.repository.find_by_broker_order_id(broker_order_id)
+            if broker_order_id is not None
+            else None
+        )
+        if by_order is not None and perm_id:
+            if by_order.broker_perm_id not in (None, perm_id):
+                raise ValueError("Conflicting broker orderId/permId")
+            if by_perm is not None and by_perm.order_uuid != by_order.order_uuid:
+                raise ValueError("Broker identities resolve to different orders")
+        return by_perm or by_order
 
     async def _audit(self, action: str, object_id: str, before, after) -> None:
         await self.repository.append_audit(
@@ -354,7 +488,7 @@ class OrderManager:
     async def _publish(self, event_type: EventType, payload: dict) -> None:
         if self.event_bus is None:
             return
-        await self.event_bus.publish(DomainEvent(type=event_type, payload=payload))
+        self._pending_events.append(DomainEvent(type=event_type, payload=payload))
 
     @staticmethod
     def _intent_view(intent: LimitOrderIntent) -> dict:

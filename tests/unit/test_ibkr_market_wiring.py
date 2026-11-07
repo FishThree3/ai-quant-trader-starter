@@ -38,9 +38,7 @@ class RecordingApp:
 
 
 def make_manager() -> IBKRConnectionManager:
-    manager = IBKRConnectionManager(
-        IBKRConnectionConfig(host="127.0.0.1", port=7497, client_id=99)
-    )
+    manager = IBKRConnectionManager(IBKRConnectionConfig(host="127.0.0.1", port=7497, client_id=99))
     manager._app = RecordingApp()
     manager.next_order_id = 1
     manager.state = BrokerState.READY
@@ -152,7 +150,7 @@ async def test_entitlement_error_is_memoised_instead_of_re_requested():
 
     manager._on_error(
         req_id=90_000,
-        code=10167,
+        code=354,
         message="No market data permissions for ISLAND STK",
         reject="",
     )

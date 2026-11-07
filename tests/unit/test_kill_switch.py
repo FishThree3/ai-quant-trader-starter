@@ -55,7 +55,9 @@ def switch(store=None, plane=None, **overrides):
         "clock": lambda: T0,
     }
     kwargs.update(overrides)
-    return KillSwitch(store if store is not None else StubStore(state_at()), control_plane=plane, **kwargs)
+    return KillSwitch(
+        store if store is not None else StubStore(state_at()), control_plane=plane, **kwargs
+    )
 
 
 # --- the ACTIVE verdict needs all three proofs at once -------------------------
@@ -247,12 +249,19 @@ async def build_gated_manager(session_factory, gate):
         def is_ready(self):
             return True
 
-        def place_limit_order(self, intent):
-            self.placed.append(intent)
+        def allocate_order_id(self):
             return 77
+
+        def place_limit_order(self, intent, broker_order_id):
+            self.placed.append(intent)
+            return broker_order_id
 
         def cancel_order(self, broker_order_id):
             self.cancelled.append(broker_order_id)
+
+    class AllowRisk:
+        async def authorize(self, intent):
+            pass
 
     manager = OrderManager(
         ReadyGateway(),
@@ -260,6 +269,7 @@ async def build_gated_manager(session_factory, gate):
         gate=gate,
         trading_mode=TradingMode.PAPER,
         allow_live_trading=False,
+        risk_check=AllowRisk(),
     )
     return manager
 

@@ -9,7 +9,9 @@ class TradingMode(StrEnum):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_file=".env", extra="ignore", case_sensitive=False, allow_inf_nan=False
+    )
 
     app_env: str = "development"
     app_name: str = "ai-quant-trader"
@@ -20,11 +22,12 @@ class Settings(BaseSettings):
     allow_live_trading: bool = False
 
     ibkr_host: str = "127.0.0.1"
-    ibkr_port: int = 7947
-    ibkr_client_id: int = 71
+    ibkr_port: int = Field(default=7497, ge=1, le=65535)
+    ibkr_client_id: int = Field(default=71, ge=1)
     ibkr_account: str | None = None
-    ibkr_connect_timeout_seconds: int = 15
-    ibkr_stale_data_seconds: int = 10
+    ibkr_read_only: bool = True
+    ibkr_connect_timeout_seconds: int = Field(default=15, gt=0)
+    ibkr_stale_data_seconds: int = Field(default=10, gt=0)
 
     market_data_symbols: str = ""
     market_data_type: int = Field(default=1, ge=1, le=4)
@@ -42,12 +45,21 @@ class Settings(BaseSettings):
 
     @property
     def watched_symbols(self) -> list[str]:
-        return [s.strip().upper() for s in self.market_data_symbols.split(",") if s.strip()]
+        return list(
+            dict.fromkeys(
+                s.strip().upper() for s in self.market_data_symbols.split(",") if s.strip()
+            )
+        )
 
     @model_validator(mode="after")
     def protect_live_trading(self):
-        if self.trading_mode == TradingMode.LIVE and not self.allow_live_trading:
-            raise ValueError("LIVE trading requested while ALLOW_LIVE_TRADING=false")
+        if self.trading_mode == TradingMode.LIVE or self.allow_live_trading:
+            raise ValueError(
+                "This application supports PAPER trading only; live must stay disabled"
+            )
+        self.ibkr_account = (self.ibkr_account or "").strip() or None
+        if self.ibkr_account and not self.ibkr_account.startswith("DU"):
+            raise ValueError("IBKR_ACCOUNT must identify a DU paper account")
         return self
 
 

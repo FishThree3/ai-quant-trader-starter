@@ -24,6 +24,10 @@ class FindingCode(StrEnum):
     POSITION_QUANTITY_MISMATCH = "POSITION_QUANTITY_MISMATCH"
     POSITION_COST_MISMATCH = "POSITION_COST_MISMATCH"
     RECONCILIATION_INCOMPLETE = "RECONCILIATION_INCOMPLETE"
+    ORDER_IDENTITY_MISMATCH = "ORDER_IDENTITY_MISMATCH"
+    EXECUTION_MISMATCH = "EXECUTION_MISMATCH"
+    ACCOUNT_MISMATCH = "ACCOUNT_MISMATCH"
+    CONNECTION_CHANGED = "CONNECTION_CHANGED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +84,8 @@ class BrokerExecution:
     exchange: str | None = None
     executed_at: datetime | None = None
     account: str | None = None
+    broker_order_id: int | None = None
+    client_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +146,8 @@ class LocalExecution:
     ref: str
     exec_id: str
     perm_id: int | None
+    quantity: float | None = None
+    price: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

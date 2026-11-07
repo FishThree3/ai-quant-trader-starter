@@ -24,9 +24,9 @@ PRICE_TOLERANCE = 1e-6
 _SIDE_ALIASES = {"BOT": "BUY", "SLD": "SELL", "BUY": "BUY", "SELL": "SELL"}
 
 # Never sent to the broker, so their absence from broker open orders is expected.
-_PRE_SUBMIT = {"CREATED", "PENDING_SUBMIT"}
+_PRE_SUBMIT = {"CREATED"}
 # The broker must acknowledge these, so absence is a real mismatch.
-_EXPECTED_AT_BROKER = {"SUBMITTED", "PARTIALLY_FILLED", "CANCEL_PENDING"}
+_EXPECTED_AT_BROKER = {"PENDING_SUBMIT", "SUBMITTED", "PARTIALLY_FILLED", "CANCEL_PENDING"}
 # We no longer expect these at the broker, but IBKR may still report them.
 _TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
 
@@ -73,6 +73,16 @@ def reconcile(
             )
         )
 
+    for row in (*broker.orders, *broker.positions, *broker.executions):
+        if row.account is not None and row.account != broker.account:
+            findings.append(
+                Finding(
+                    FindingCode.ACCOUNT_MISMATCH,
+                    "Snapshot contains another account's records.",
+                    details={"expected": broker.account, "observed": row.account},
+                )
+            )
+
     local_by_perm = _index_by_perm(local.orders, "perm_id")
     local_by_order_id = _index_by_perm(local.orders, "broker_order_id")
     matched_local_refs: set[str] = set()
@@ -95,8 +105,7 @@ def reconcile(
                     Finding(
                         code=FindingCode.BROKER_ONLY_ORDER,
                         message=(
-                            "Broker reports an order with no local record; refusing to "
-                            "create one."
+                            "Broker reports an order with no local record; refusing to create one."
                         ),
                         details={
                             "perm_id": order.perm_id,
@@ -112,16 +121,18 @@ def reconcile(
 
         matched_local_refs.add(local_order.ref)
         orders_matched += 1
-        findings.extend(
-            _compare_order(order, local_order, quantity_tolerance=quantity_tolerance)
-        )
+        findings.extend(_compare_order(order, local_order, quantity_tolerance=quantity_tolerance))
 
     for local_order in local.orders:
-        if local_order.ref in matched_local_refs:
-            continue
         status = (local_order.status or "").strip().upper()
+        if local_order.ref in matched_local_refs and status != "UNKNOWN":
+            continue
 
-        if status in _PRE_SUBMIT and local_order.perm_id is None:
+        if (
+            status in _PRE_SUBMIT
+            and local_order.perm_id is None
+            and local_order.broker_order_id is None
+        ):
             continue
 
         if status == "UNKNOWN":
@@ -132,7 +143,7 @@ def reconcile(
                     details={"ref": local_order.ref, "perm_id": local_order.perm_id},
                 )
             )
-        elif status in _EXPECTED_AT_BROKER:
+        elif status in _EXPECTED_AT_BROKER or status == "CREATED":
             findings.append(
                 Finding(
                     code=FindingCode.LOCAL_ONLY_OPEN_ORDER,
@@ -149,6 +160,7 @@ def reconcile(
 
     broker_exec_ids = {e.exec_id for e in broker.executions if e.exec_id}
     local_exec_ids = {e.exec_id for e in local.executions if e.exec_id}
+    local_execs = {e.exec_id: e for e in local.executions if e.exec_id}
     executions_matched = 0
 
     # IBKR can redeliver the same execDetails; counting one fill twice would make
@@ -173,6 +185,26 @@ def reconcile(
                         "perm_id": execution.perm_id,
                         "quantity": execution.quantity,
                     },
+                )
+            )
+            continue
+        recorded = local_execs[execution.exec_id]
+        if (
+            recorded.perm_id != execution.perm_id
+            or (
+                recorded.quantity is not None
+                and not _close(recorded.quantity, execution.quantity, quantity_tolerance)
+            )
+            or (
+                recorded.price is not None
+                and not _close(recorded.price, execution.price, price_tolerance)
+            )
+        ):
+            findings.append(
+                Finding(
+                    FindingCode.EXECUTION_MISMATCH,
+                    "Execution ownership or economics differ.",
+                    details={"exec_id": execution.exec_id},
                 )
             )
             continue
@@ -287,6 +319,23 @@ def _compare_order(
     broker_side = normalize_side(order.side)
     local_side = normalize_side(local_order.side)
     status = (local_order.status or "").strip().upper()
+
+    if order.instrument != local_order.instrument or (
+        order.perm_id is not None
+        and local_order.perm_id is not None
+        and order.perm_id != local_order.perm_id
+    ):
+        findings.append(
+            Finding(
+                FindingCode.ORDER_IDENTITY_MISMATCH,
+                "Order instrument or permanent ID differs.",
+                details={
+                    "ref": local_order.ref,
+                    "broker_perm_id": order.perm_id,
+                    "local_perm_id": local_order.perm_id,
+                },
+            )
+        )
 
     if broker_side != local_side:
         findings.append(

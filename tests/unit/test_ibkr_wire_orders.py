@@ -4,7 +4,6 @@ The order manager's own tests use a fake gateway, which would hide a misspelled
 ibapi attribute. These tests drive the actual place_limit_order / cancel_order.
 """
 
-
 import pytest
 
 from core.broker.base import BrokerState
@@ -31,8 +30,9 @@ class RecordingApp:
 
 def ready_manager() -> IBKRConnectionManager:
     manager = IBKRConnectionManager(
-        IBKRConnectionConfig(host="127.0.0.1", port=7497, client_id=99)
+        IBKRConnectionConfig(host="127.0.0.1", port=7497, client_id=99, read_only=False)
     )
+    manager._on_managed_accounts(["DU123456"])
     manager._app = RecordingApp()
     manager.next_order_id = 7
     manager.state = BrokerState.READY
@@ -69,6 +69,26 @@ def test_place_limit_order_builds_the_wire_objects_correctly():
     assert float(order.totalQuantity) == 3.0
     assert order.lmtPrice == pytest.approx(250.5)
     assert order.tif == "DAY"
+    assert order.account == "DU123456"
+    assert order.orderRef
+
+
+def test_reserved_id_is_used_exactly_once():
+    manager = ready_manager()
+    order = intent()
+    order_id = manager.allocate_order_id()
+    assert manager._app.placed == []
+    assert manager.place_limit_order(order, order_id) == order_id
+    with pytest.raises(RuntimeError, match="already been transmitted"):
+        manager.place_limit_order(order, order_id)
+    assert len(manager._app.placed) == 1
+
+
+def test_unreserved_id_cannot_be_transmitted():
+    manager = ready_manager()
+    with pytest.raises(RuntimeError, match="not reserved"):
+        manager.place_limit_order(intent(), 100)
+    assert manager._app.placed == []
 
 
 def test_allocated_ids_advance_and_never_reuse():

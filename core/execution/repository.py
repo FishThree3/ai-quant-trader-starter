@@ -23,6 +23,10 @@ class OrderRecord:
     broker_perm_id: int | None
     submitted_at: datetime | None
     completed_at: datetime | None
+    sec_type: str = "STK"
+    exchange: str = "SMART"
+    currency: str = "USD"
+    time_in_force: str = "DAY"
 
 
 class OrderRepository(Protocol):

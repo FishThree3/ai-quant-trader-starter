@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -10,7 +11,7 @@ from apps.api.deps import get_kill_switch, get_sessionmaker
 from apps.api.main import app
 from core.controls.kill_switch import AlwaysActive
 from database.broker_state import latest_state_event, record_state_event
-from database.models import Base
+from database.models import Base, BrokerEvent
 
 EVENT_META = {
     "next_order_id": 42,
@@ -151,3 +152,36 @@ async def test_health_endpoint_still_reports_configuration(session_factory):
     assert body["status"] == "ok"
     assert body["trading_mode"] == "PAPER"
     assert body["allow_live_trading"] is False
+
+
+async def test_old_ready_heartbeat_is_unknown_and_never_tradeable(session_factory):
+    async with session_factory() as session:
+        session.add(
+            BrokerEvent(
+                event_type="broker.heartbeat",
+                state="READY",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                metadata_json={**EVENT_META, "read_only": False, "submission_enabled": True},
+            )
+        )
+        await session.commit()
+    async with client_for(session_factory) as client:
+        body = await _get(client)
+    assert body["broker"] == "UNKNOWN"
+    assert body["broker_stale"] is True
+    assert body["new_orders_allowed"] is False
+
+
+async def test_read_only_ready_broker_does_not_advertise_order_access(session_factory):
+    async with session_factory() as session:
+        await record_state_event(
+            session,
+            event_type="broker.heartbeat",
+            state="READY",
+            metadata={**EVENT_META, "read_only": True},
+        )
+    async with client_for(session_factory) as client:
+        body = await _get(client)
+    assert body["broker"] == "READY"
+    assert body["gate_allows_new_orders"] is True
+    assert body["new_orders_allowed"] is False

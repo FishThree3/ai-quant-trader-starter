@@ -31,16 +31,9 @@ async def test_live_ticks_produce_usable_quotes():
         pytest.fail("market data verification is only allowed against a Paper session")
 
     broker = IBKRBroker(
-        IBKRConnectionConfig(
-            host=settings.ibkr_host,
-            port=settings.ibkr_port,
-            client_id=settings.ibkr_client_id + 3,
-            timeout_seconds=settings.ibkr_connect_timeout_seconds,
-        )
+        IBKRConnectionConfig.from_settings(settings, read_only=True, client_id_offset=3)
     )
-    service = MarketDataService(
-        broker, stale_seconds=float(settings.ibkr_stale_data_seconds)
-    )
+    service = MarketDataService(broker, stale_seconds=float(settings.ibkr_stale_data_seconds))
     broker.add_order_listener(service)
 
     resolver = ContractResolver()
@@ -114,12 +107,7 @@ async def test_unsubscribing_releases_every_broker_line():
     from core.market.service import MarketDataService
 
     broker = IBKRBroker(
-        IBKRConnectionConfig(
-            host=settings.ibkr_host,
-            port=settings.ibkr_port,
-            client_id=settings.ibkr_client_id + 4,
-            timeout_seconds=settings.ibkr_connect_timeout_seconds,
-        )
+        IBKRConnectionConfig.from_settings(settings, read_only=True, client_id_offset=4)
     )
     service = MarketDataService(broker)
     broker.add_order_listener(service)

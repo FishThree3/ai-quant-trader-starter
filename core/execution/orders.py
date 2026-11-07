@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 from uuid import UUID, uuid4
 
 from database.models import OrderStatus
@@ -35,9 +36,9 @@ class LimitOrderIntent:
     def __post_init__(self) -> None:
         if self.side not in SIDES:
             raise ValueError(f"side must be one of {sorted(SIDES)}")
-        if self.quantity <= 0:
+        if not isfinite(self.quantity) or self.quantity <= 0:
             raise ValueError("quantity must be positive")
-        if self.limit_price <= 0:
+        if not isfinite(self.limit_price) or self.limit_price <= 0:
             raise ValueError("limit_price must be positive; MARKET orders are not supported")
         if not self.symbol or not self.sec_type or not self.exchange or not self.currency:
             raise ValueError("symbol, sec_type, exchange and currency are required")

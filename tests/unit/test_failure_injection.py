@@ -80,6 +80,11 @@ async def seed_live_order(session_factory):
         return UUID(int=8)
 
 
+class AllowRisk:
+    async def authorize(self, intent):
+        pass
+
+
 class BrokerStub:
     """A gateway that can be made unavailable mid-flight, and doubles as the md gateway."""
 
@@ -93,9 +98,12 @@ class BrokerStub:
     def is_ready(self):
         return self.ready_flag
 
-    def place_limit_order(self, intent):
-        self.placed.append(intent)
+    def allocate_order_id(self):
         return 77
+
+    def place_limit_order(self, intent, broker_order_id):
+        self.placed.append(intent)
+        return broker_order_id
 
     def cancel_order(self, broker_order_id):
         self.cancelled.append(broker_order_id)
@@ -114,6 +122,7 @@ def manager_for(session_factory, gate=None, broker=None):
         gate=gate or AlwaysActive(),
         trading_mode=TradingMode.PAPER,
         allow_live_trading=False,
+        risk_check=AllowRisk(),
     )
 
 
@@ -337,6 +346,7 @@ async def test_a_database_write_failure_blocks_submission_before_transmission(se
         gate=gate,
         trading_mode=TradingMode.PAPER,
         allow_live_trading=False,
+        risk_check=AllowRisk(),
     )
 
     with pytest.raises(Exception, match="temporarily unavailable"):
@@ -376,9 +386,7 @@ class FlakyPlane:
 
 async def test_losing_redis_stops_new_orders_then_recovers(session_factory):
     plane = FlakyPlane()
-    gate = KillSwitch(
-        _ActiveStore(), control_plane=plane, clock=lambda: T0, max_age_seconds=30.0
-    )
+    gate = KillSwitch(_ActiveStore(), control_plane=plane, clock=lambda: T0, max_age_seconds=30.0)
     manager = manager_for(session_factory, gate=gate)
     await gate.refresh()
     assert gate.allows_new_orders() is True

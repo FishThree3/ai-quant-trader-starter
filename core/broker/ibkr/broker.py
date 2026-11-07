@@ -34,8 +34,14 @@ class IBKRBroker(Broker):
     def is_ready(self) -> bool:
         return self.connection.is_ready()
 
-    def place_limit_order(self, intent) -> int:
-        return self.connection.place_limit_order(intent)
+    def can_submit_orders(self) -> bool:
+        return self.connection.can_submit_orders()
+
+    def allocate_order_id(self) -> int:
+        return self.connection.allocate_order_id()
+
+    def place_limit_order(self, intent, broker_order_id: int | None = None) -> int:
+        return self.connection.place_limit_order(intent, broker_order_id)
 
     def cancel_order(self, broker_order_id: int) -> None:
         self.connection.cancel_order(broker_order_id)

@@ -110,7 +110,8 @@ def test_status_reports_the_real_gate_not_a_hardcoded_guess(gate_client):
     body = client.get("/api/system/status").json()
 
     assert body["trading_state"] == "ACTIVE"
-    assert body["new_orders_allowed"] is True
+    assert body["gate_allows_new_orders"] is True
+    assert body["new_orders_allowed"] is False, "an ACTIVE gate alone is not trading readiness"
     assert body["gate_reason"] == "go"
 
 
@@ -166,9 +167,13 @@ def test_kill_is_written_durably_and_signalled(gate_client):
 
 def test_resume_reopens_trading(gate_client):
     client, gate, store, plane = gate_client
-    client.post("/api/system/kill", headers=AUTH, json={"reason": "something looks wrong", "actor": "kvn"})
+    client.post(
+        "/api/system/kill", headers=AUTH, json={"reason": "something looks wrong", "actor": "kvn"}
+    )
 
-    response = client.post("/api/system/resume", headers=AUTH, json={"reason": "incident closed", "actor": "kvn"})
+    response = client.post(
+        "/api/system/resume", headers=AUTH, json={"reason": "incident closed", "actor": "kvn"}
+    )
 
     assert response.json()["trading_state"] == "ACTIVE"
     assert gate.allows_new_orders() is True
@@ -190,7 +195,9 @@ def test_pause_is_distinct_from_kill(gate_client):
 def test_kill_is_reflected_by_a_following_status_call(gate_client):
     client, gate, store, plane = gate_client
 
-    client.post("/api/system/kill", headers=AUTH, json={"reason": "risk breach suspected", "actor": "kvn"})
+    client.post(
+        "/api/system/kill", headers=AUTH, json={"reason": "risk breach suspected", "actor": "kvn"}
+    )
     body = client.get("/api/system/status").json()
 
     assert body["trading_state"] == "KILLED"
@@ -204,10 +211,10 @@ def test_a_failed_write_is_reported_as_a_failure_not_a_confirmed_kill(session_fa
     try:
         with TestClient(app) as client:
             response = client.post(
-        "/api/system/kill",
-        headers=AUTH,
-        json={"reason": "try to kill", "actor": "kvn"},
-    )
+                "/api/system/kill",
+                headers=AUTH,
+                json={"reason": "try to kill", "actor": "kvn"},
+            )
     finally:
         app.dependency_overrides.clear()
 
@@ -223,10 +230,10 @@ def test_a_lost_poke_does_not_undo_the_durable_decision(session_factory):
     try:
         with TestClient(app) as client:
             response = client.post(
-        "/api/system/kill",
-        headers=AUTH,
-        json={"reason": "kill me anyway", "actor": "kvn"},
-    )
+                "/api/system/kill",
+                headers=AUTH,
+                json={"reason": "kill me anyway", "actor": "kvn"},
+            )
     finally:
         app.dependency_overrides.clear()
 
@@ -241,7 +248,9 @@ def test_an_empty_reason_is_rejected_before_touching_the_store(session_factory):
     app.dependency_overrides[get_kill_switch] = lambda: gate
     try:
         with TestClient(app) as client:
-            response = client.post("/api/system/kill", headers=AUTH, json={"reason": "no", "actor": "kvn"})
+            response = client.post(
+                "/api/system/kill", headers=AUTH, json={"reason": "no", "actor": "kvn"}
+            )
     finally:
         app.dependency_overrides.clear()
 

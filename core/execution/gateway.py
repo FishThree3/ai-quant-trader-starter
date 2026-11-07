@@ -12,7 +12,11 @@ class OrderGateway(Protocol):
         """True only when the broker has been identified and reconciled."""
         ...
 
-    def place_limit_order(self, intent: LimitOrderIntent) -> int:
+    def allocate_order_id(self) -> int:
+        """Reserve a one-use broker ID without transmitting anything."""
+        ...
+
+    def place_limit_order(self, intent: LimitOrderIntent, broker_order_id: int) -> int:
         """Transmit the order and return the broker-assigned order id.
 
         Success here means only that the request reached the socket; it never
@@ -22,4 +26,10 @@ class OrderGateway(Protocol):
 
     def cancel_order(self, broker_order_id: int) -> None:
         """Request cancellation; the outcome arrives via callbacks."""
+        ...
+
+
+class PreTradeCheck(Protocol):
+    async def authorize(self, intent: LimitOrderIntent) -> None:
+        """Raise unless fresh risk context authorizes this exact intent."""
         ...

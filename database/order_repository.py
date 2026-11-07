@@ -6,6 +6,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 from core.execution.orders import LimitOrderIntent
 from core.execution.repository import OrderRecord
@@ -54,6 +55,7 @@ class SqlAlchemyOrderRepository:
                     order_type="LMT",
                     quantity=intent.quantity,
                     limit_price=intent.limit_price,
+                    time_in_force=intent.time_in_force,
                     status="CREATED",
                     filled_quantity=0.0,
                 )
@@ -63,9 +65,11 @@ class SqlAlchemyOrderRepository:
     async def get_order(self, order_uuid: UUID) -> OrderRecord | None:
         async with self.session_factory() as session:
             row = (
-                await session.execute(select(Order, Instrument)
+                await session.execute(
+                    select(Order, Instrument)
                     .join(Instrument, Order.instrument_id == Instrument.id)
-                    .where(Order.id == order_uuid))
+                    .where(Order.id == order_uuid)
+                )
             ).one_or_none()
             return _to_record(row) if row else None
 
@@ -112,13 +116,11 @@ class SqlAlchemyOrderRepository:
     ) -> bool:
         async with self.session_factory() as session:
             duplicate = (
-                await session.execute(
-                    select(Execution.id).where(Execution.broker_exec_id == exec_id)
-                )
-            ).one_or_none()
+                await session.execute(select(Execution).where(Execution.broker_exec_id == exec_id))
+            ).scalar_one_or_none()
             if duplicate is not None:
+                _validate_execution_replay(duplicate, order_uuid, quantity, price)
                 return False
-
             session.add(
                 Execution(
                     broker_exec_id=exec_id,
@@ -129,16 +131,28 @@ class SqlAlchemyOrderRepository:
                     executed_at=executed_at,
                 )
             )
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                duplicate = (
+                    await session.execute(
+                        select(Execution).where(Execution.broker_exec_id == exec_id)
+                    )
+                ).scalar_one_or_none()
+                if duplicate is None:
+                    raise
+                _validate_execution_replay(duplicate, order_uuid, quantity, price)
+                return False
             return True
 
     async def executions_for(self, order_uuid: UUID) -> list[dict[str, Any]]:
         async with self.session_factory() as session:
             rows = (
-                await session.execute(
-                    select(Execution).where(Execution.order_id == order_uuid)
-                )
-            ).scalars().all()
+                (await session.execute(select(Execution).where(Execution.order_id == order_uuid)))
+                .scalars()
+                .all()
+            )
             return [
                 {"exec_id": r.broker_exec_id, "quantity": r.quantity, "price": r.price}
                 for r in rows
@@ -167,6 +181,13 @@ class SqlAlchemyOrderRepository:
             await session.commit()
 
 
+def _validate_execution_replay(
+    row: Execution, order_uuid: UUID, quantity: float, price: float
+) -> None:
+    if row.order_id != order_uuid or row.quantity != quantity or row.price != price:
+        raise ValueError("Conflicting execution replay for an existing execId")
+
+
 def _to_record(row) -> OrderRecord:
     order, instrument = row
     return OrderRecord(
@@ -183,4 +204,8 @@ def _to_record(row) -> OrderRecord:
         broker_perm_id=order.broker_perm_id,
         submitted_at=order.submitted_at,
         completed_at=order.completed_at,
+        sec_type=instrument.sec_type,
+        exchange=instrument.exchange,
+        currency=instrument.currency,
+        time_in_force=order.time_in_force,
     )

@@ -78,7 +78,7 @@ async def system_status(
     # checks right after pulling the kill switch.
     gate_state = await gate.refresh()
     payload["trading_state"] = gate_state.state.value
-    payload["new_orders_allowed"] = gate.allows_new_orders()
+    payload["gate_allows_new_orders"] = gate.allows_new_orders()
     payload["gate_reason"] = gate_state.reason
 
     try:
@@ -105,6 +105,26 @@ async def system_status(
             "next_order_id": metadata.get("next_order_id"),
             "reconciliation": metadata.get("reconciliation"),
         }
+    )
+    try:
+        recorded = datetime.fromisoformat(latest["recorded_at"])
+        if recorded.tzinfo is None:  # SQLite strips the UTC timezone on reads.
+            recorded = recorded.replace(tzinfo=timezone.utc)
+        age = (utcnow() - recorded).total_seconds()
+        stale = not 0 <= age <= settings.ibkr_stale_data_seconds * 3
+    except (ValueError, TypeError):
+        stale = True
+    payload["broker_stale"] = stale
+    if stale:
+        payload["broker"] = "UNKNOWN"
+    payload["read_only"] = metadata.get("read_only", True)
+    payload["submission_enabled"] = metadata.get("submission_enabled", False)
+    payload["new_orders_allowed"] = bool(
+        payload["gate_allows_new_orders"]
+        and payload["broker"] == "READY"
+        and not stale
+        and not payload["read_only"]
+        and payload["submission_enabled"]
     )
     return payload
 
@@ -195,23 +215,43 @@ async def resume_trading(
 
 
 def _freshness(payload: dict[str, Any]) -> dict[str, Any]:
-    """Age a quote against the same limit risk uses, so readers see what traders get."""
+    """Use the executable BBO gate, not transport traffic, for API freshness."""
+    from core.market.models import MarketInstrument, Quote
+
     limit = float(settings.ibkr_stale_data_seconds)
-    raw = payload.get("received_at")
 
-    if not raw:
+    def timestamp(name: str) -> datetime | None:
+        try:
+            stamp = datetime.fromisoformat(str(payload.get(name)))
+            if stamp.utcoffset() is None:
+                return None
+            return stamp.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    received_at = timestamp("received_at")
+    if received_at is None:
         return {"age_seconds": None, "stale": True, "max_age_seconds": limit}
 
-    try:
-        stamp = datetime.fromisoformat(str(raw))
-    except ValueError:
-        return {"age_seconds": None, "stale": True, "max_age_seconds": limit}
-
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-
-    age = (utcnow() - stamp).total_seconds()
-    return {"age_seconds": round(age, 3), "stale": age > limit, "max_age_seconds": limit}
+    # Explicit None fails closed for old cache payloads without per-price stamps.
+    # Only direct Quote constructors have the legacy snapshot-time fallback.
+    quote = Quote(
+        instrument=MarketInstrument("", "", "", ""),
+        received_at=received_at,
+        bid=payload.get("bid"),
+        ask=payload.get("ask"),
+        bid_at=timestamp("bid_at"),
+        ask_at=timestamp("ask_at"),
+        delayed=payload.get("delayed", False) is not False,
+        market_data_type=payload.get("market_data_type", 1),
+    )
+    now = utcnow()
+    age = quote.price_age_seconds(now)
+    return {
+        "age_seconds": round(age, 3) if age is not None else None,
+        "stale": not quote.is_fresh(limit, now),
+        "max_age_seconds": limit,
+    }
 
 
 @app.get("/api/market/{symbol}")

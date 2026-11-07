@@ -30,7 +30,9 @@ async def session():
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with factory() as s:
-        s.add(Instrument(id=_uuid(1), symbol="AAPL", sec_type="STK", exchange="SMART", currency="USD"))
+        s.add(
+            Instrument(id=_uuid(1), symbol="AAPL", sec_type="STK", exchange="SMART", currency="USD")
+        )
         await s.commit()
         yield s
     await engine.dispose()
@@ -65,7 +67,9 @@ def snapshot_with_execution(exec_id="EX-1", perm_id=1001, quantity=4.0):
         account="DUR123456",
         orders=(BrokerOrder(perm_id, 17, AAPL, "BOT", 10.0, quantity, "Submitted"),),
         positions=(),
-        executions=(BrokerExecution(exec_id, perm_id, AAPL, "BOT", quantity, 250.0, "ISLAND", EXEC_TIME),),
+        executions=(
+            BrokerExecution(exec_id, perm_id, AAPL, "BOT", quantity, 250.0, "ISLAND", EXEC_TIME),
+        ),
         orders_complete=True,
         positions_complete=True,
         executions_complete=True,
@@ -152,6 +156,13 @@ async def test_unpersisted_broker_fill_blocks_until_repaired(session):
 
     codes = [f.code for f in result.blocking]
     assert FindingCode.EXECUTION_NOT_PERSISTED in codes
+
+
+async def test_conflicting_replayed_execution_is_not_hidden(session):
+    await seed_order(session)
+    await persist_broker_snapshot(session, snapshot_with_execution(quantity=4))
+    with pytest.raises(ValueError, match="Conflicting execution"):
+        await persist_broker_snapshot(session, snapshot_with_execution(quantity=5))
 
 
 def select_exec_count():

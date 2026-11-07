@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 
 from core.broker.base import BrokerState
-from core.broker.ibkr.connection import EXECUTIONS_REQ_ID, IBKRConnectionConfig, IBKRConnectionManager
+from core.broker.ibkr.connection import (
+    EXECUTIONS_REQ_ID,
+    IBKRConnectionConfig,
+    IBKRConnectionManager,
+)
 from core.reconciliation.models import (
     FindingCode,
     InstrumentKey,
@@ -26,7 +30,7 @@ def make_manager(timeout_seconds: int = 5) -> IBKRConnectionManager:
 
 
 def contract(symbol="AAPL", sec_type="STK", currency="USD"):
-    return SimpleNamespace(code=symbol, secType=sec_type, currency=currency)
+    return SimpleNamespace(symbol=symbol, secType=sec_type, currency=currency)
 
 
 def open_order(order_id=17, perm_id=1001, action="BOT", total="10", filled="0", status="Submitted"):
@@ -69,6 +73,9 @@ class FakeApp:
     def isConnected(self):  # noqa: N802
         return True
 
+    def disconnect(self):
+        pass
+
     def reqOpenOrders(self):  # noqa: N802
         for row in self._orders:
             self.owner._on_open_order(*row)
@@ -92,7 +99,7 @@ class FakeApp:
 def armed(manager: IBKRConnectionManager) -> IBKRConnectionManager:
     """Simulate the post-handshake state connect() leaves behind."""
     manager.next_order_id = 1
-    manager.account = "DUR123456"
+    manager._on_managed_accounts(["DUR123456"])
     manager.state = BrokerState.SYNCING
     return manager
 
